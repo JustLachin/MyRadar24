@@ -1,6 +1,6 @@
 # MyRadar24
 
-A premium, dark-themed desktop application for tracking flights in real time, built with **PyQt6** and powered by the **FlightRadar24 API**.
+A desktop application for tracking flights in real time, built with **PyQt6** and powered by the **FlightRadar24 API**.
 
 ![MyRadar24](logo.png)
 
