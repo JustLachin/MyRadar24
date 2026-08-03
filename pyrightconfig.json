@@ -1,0 +1,18 @@
+{
+  "pythonVersion": "3.10",
+  "venvPath": ".",
+  "extraPaths": [
+    "SDK/python"
+  ],
+  "reportMissingImports": true,
+  "reportMissingModuleSource": false,
+  "reportUninitializedInstanceVariable": false,
+  "reportOptionalMemberAccess": false,
+  "reportOptionalCall": false,
+  "reportOptionalIterable": false,
+  "reportConstantRedefinition": false,
+  "reportIncompatibleMethodOverride": false,
+  "reportAny": false,
+  "reportPrivateUsage": false,
+  "reportUnknownMemberType": false
+}

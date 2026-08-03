@@ -1,0 +1,584 @@
+const Core = require("./core");
+const { APIClient } = require("./request");
+const Airport = require("./entities/airport");
+const Flight = require("./entities/flight");
+const FlightTrackerConfig = require("./flightTrackerConfig");
+const { AirportNotFoundError, LoginError } = require("./errors");
+const { isNumeric, radians, rad2deg } = require("./util");
+const { parseAirlinesHtml, parseAirportsHtml } = require("./parsers");
+
+
+/**
+ * Run fn over every item with at most concurrency tasks in flight at once.
+ *
+ * @param {Array} items
+ * @param {number} concurrency
+ * @param {Function} fn
+ * @return {Promise<void>}
+ */
+async function mapConcurrent(items, concurrency, fn) {
+    let i = 0;
+    /** @return {Promise<void>} */
+    async function worker() {
+        while (i < items.length) {
+            await fn(items[i++]);
+        }
+    }
+    await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+}
+
+/**
+ * Main class of the FlightRadarAPI
+ */
+class FlightRadar24API {
+    /**
+     * Constructor of FlightRadar24API class
+     *
+     * @param {object} [options={}]
+     * @param {number} [options.timeout=30000] - Request timeout in milliseconds
+     * @param {number} [options.maxWorkers=8] - Maximum concurrent requests when fetching flight details
+     * @param {object} [options.impersonate] - TLS impersonation profile override
+     *     (`{ciphers, sigalgs, ecdhCurve}`). Use when FR24 updates its Cloudflare
+     *     bot mitigation faster than this library releases.
+     */
+    constructor({ timeout = 30000, maxWorkers = 8, impersonate = null, retry = null } = {}) {
+        this.__flightTrackerConfig = new FlightTrackerConfig();
+        this.__loginData = null;
+        this.__client = new APIClient({ impersonate, retry });
+        this.timeout = timeout;
+        this.maxWorkers = maxWorkers;
+    }
+
+    /**
+     * Return a list with all airlines.
+     *
+     * @return {Promise<Array<object>>}
+     */
+    async getAirlines() {
+        const { content } = await this.__client.request(
+            Core.airlinesDataUrl, { headers: Core.htmlHeaders, timeout: this.timeout });
+        return parseAirlinesHtml(content);
+    }
+
+    /**
+     * Download the logo of an airline from FlightRadar24 and return it as bytes.
+     * Returns null if the logo is not found.
+     *
+     * @param {string} iata - IATA of the airline
+     * @param {string} icao - ICAO of the airline
+     * @return {Promise<[object, string] | null>}
+     */
+    async getAirlineLogo(iata, icao) {
+        iata = iata.toUpperCase();
+        icao = icao.toUpperCase();
+
+        const notFound = [403, 404];
+
+        const firstLogoUrl = Core.airlineLogoUrl(iata, icao);
+        let { content, statusCode } = await this.__client.request(firstLogoUrl, {
+            headers: Core.imageHeaders,
+            allowedErrorCodes: notFound,
+            timeout: this.timeout,
+        });
+
+        if (statusCode < 400) {
+            return [content, firstLogoUrl.split(".").pop()];
+        }
+
+        const secondLogoUrl = Core.alternativeAirlineLogoUrl(icao);
+        ({ content, statusCode } = await this.__client.request(secondLogoUrl, {
+            headers: Core.imageHeaders,
+            allowedErrorCodes: notFound,
+            timeout: this.timeout,
+        }));
+
+        if (statusCode < 400) {
+            return [content, secondLogoUrl.split(".").pop()];
+        }
+
+        return null;
+    }
+
+    /**
+     * Return basic information about a specific airport.
+     *
+     * @param {string} code - ICAO or IATA of the airport
+     * @param {boolean} details - If true, it returns flights with detailed information
+     * @return {Promise<Airport>}
+     */
+    async getAirport(code, details = false) {
+        if (code.length < 3 || code.length > 4) {
+            throw new TypeError("The code '" + code + "' is invalid. It must be the IATA or ICAO of the airport.");
+        }
+
+        if (details) {
+            const airport = new Airport();
+            airport.setAirportDetails(await this.getAirportDetails(code));
+            return airport;
+        }
+
+        const { content } = await this.__client.request(
+            Core.airportDataUrl(code), { headers: Core.jsonHeaders, timeout: this.timeout },
+        );
+        const info = content["details"];
+
+        if (info === undefined) {
+            throw new AirportNotFoundError("Could not find an airport by the code '" + code + "'.");
+        }
+        return new Airport({}, info);
+    }
+
+    /**
+     * Return the airport details from FlightRadar24.
+     *
+     * @param {string} code - ICAO or IATA of the airport
+     * @param {number} [flightLimit=100] - Limit of flights related to the airport
+     * @param {number} [page=1] - Page of result to display
+     * @return {Promise<object>}
+     */
+    async getAirportDetails(code, flightLimit = 100, page = 1) {
+        if (code.length < 3 || code.length > 4) {
+            throw new TypeError("The code '" + code + "' is invalid. It must be the IATA or ICAO of the airport.");
+        }
+
+        const params = { "format": "json", "code": code, "limit": flightLimit, "page": page };
+
+        if (this.isLoggedIn()) {
+            params["token"] = this.__client.getCookie("_frPl");
+        }
+
+        const { content, statusCode } = await this.__client.request(Core.apiAirportDataUrl, {
+            params,
+            headers: Core.jsonHeaders,
+            allowedErrorCodes: [400],
+            timeout: this.timeout,
+        });
+
+        if (statusCode === 400 && content?.["errors"] !== undefined) {
+            const errors = content["errors"]?.["errors"]?.["parameters"];
+            const limit = errors?.["limit"];
+
+            if (limit !== undefined) {
+                throw new RangeError(limit["notBetween"]);
+            }
+            throw new AirportNotFoundError("Could not find an airport by the code '" + code + "'.", errors);
+        }
+
+        const result = content["result"]["response"];
+        const data = result?.["airport"]?.["pluginData"];
+        const dataCount = data !== null && typeof data === "object" ? Object.entries(data).length : 0;
+
+        const runways = data?.["runways"];
+        const runwaysCount = runways !== null && typeof runways === "object" ? Object.entries(runways).length : 0;
+
+        if (data?.["details"] === undefined && runwaysCount === 0 && dataCount <= 3) {
+            throw new AirportNotFoundError("Could not find an airport by the code '" + code + "'.");
+        }
+
+        return result;
+    }
+
+    /**
+     * Return airport disruptions.
+     *
+     * @return {Promise<object>}
+     */
+    async getAirportDisruptions() {
+        const { content } = await this.__client.request(
+            Core.airportDisruptionsUrl, { headers: Core.jsonHeaders, timeout: this.timeout },
+        );
+        return content;
+    }
+
+    /**
+     * Return a list with all airports for specified countries.
+     *
+     * @param {Array<string>} countries - Array of country names from Countries enum
+     * @return {Promise<Array<Airport>>}
+     */
+    async getAirports(countries) {
+        const airports = [];
+        // Use stateless requests for the fan-out so per-country `Set-Cookie`
+        // responses do not race onto the shared session jar.
+        await mapConcurrent(countries, this.maxWorkers, async (countryName) => {
+            const countryHref = Core.airportsDataUrl + "/" + countryName;
+            const { content } = await this.__client.requestStandalone(
+                countryHref, { headers: Core.htmlHeaders, timeout: this.timeout },
+            );
+            airports.push(...parseAirportsHtml(content, countryHref));
+        });
+        return airports;
+    }
+
+    /**
+     * Return the bookmarks from the FlightRadar24 account.
+     *
+     * @return {Promise<object>}
+     */
+    async getBookmarks() {
+        if (!this.isLoggedIn()) {
+            throw new LoginError("You must log in to your account.");
+        }
+
+        const headers = { ...Core.jsonHeaders, "accesstoken": this.getLoginData()["accessToken"] };
+        const { content } = await this.__client.request(Core.bookmarksUrl, {
+            headers,
+            timeout: this.timeout,
+        });
+
+        return content;
+    }
+
+    /**
+     * Convert coordinate dictionary to a string "y1, y2, x1, x2".
+     *
+     * @param {object} zone - Dictionary containing the following keys: tl_y, tl_x, br_y, br_x
+     * @return {string}
+     */
+    getBounds(zone) {
+        return `${zone["tl_y"]},${zone["br_y"]},${zone["tl_x"]},${zone["br_x"]}`;
+    }
+
+    /**
+     * Convert a point coordinate and a radius to a string "y1, y2, x1, x2".
+     *
+     * @param {number} latitude - Latitude of the point
+     * @param {number} longitude - Longitude of the point
+     * @param {number} radius - Radius in meters to create area around the point
+     * @return {string}
+     */
+    getBoundsByPoint(latitude, longitude, radius) {
+        const halfSideInKm = Math.abs(radius) / 1000;
+
+        const lat = radians(latitude);
+        const lon = radians(longitude);
+
+        const approxEarthRadius = 6371;
+
+        // Distance from the centre to a corner of the bounding square.
+        const hypotenuseDistance = Math.sqrt(2 * (Math.pow(halfSideInKm, 2)));
+
+        // Diagonal bearings: 225° (SW corner, min lat/lon) and 45° (NE corner, max lat/lon).
+        const bearingSw = radians(225);
+        const bearingNe = radians(45);
+
+        // Destination-point formula along the SW bearing → south-west corner.
+        const latMin = Math.asin(
+            Math.sin(lat) * Math.cos(hypotenuseDistance / approxEarthRadius) +
+            Math.cos(lat) *
+            Math.sin(hypotenuseDistance / approxEarthRadius) *
+            Math.cos(bearingSw),
+        );
+        const lonMin = lon + Math.atan2(
+            Math.sin(bearingSw) *
+            Math.sin(hypotenuseDistance / approxEarthRadius) *
+            Math.cos(lat),
+            Math.cos(hypotenuseDistance / approxEarthRadius) -
+            Math.sin(lat) * Math.sin(latMin),
+        );
+
+        // Same formula along the NE bearing → north-east corner.
+        const latMax = Math.asin(
+            Math.sin(lat) * Math.cos(hypotenuseDistance / approxEarthRadius) +
+            Math.cos(lat) *
+            Math.sin(hypotenuseDistance / approxEarthRadius) *
+            Math.cos(bearingNe),
+        );
+        const lonMax = lon + Math.atan2(
+            Math.sin(bearingNe) *
+            Math.sin(hypotenuseDistance / approxEarthRadius) *
+            Math.cos(lat),
+            Math.cos(hypotenuseDistance / approxEarthRadius) -
+            Math.sin(lat) * Math.sin(latMax),
+        );
+
+        return this.getBounds({
+            "tl_y": rad2deg(latMax),
+            "br_y": rad2deg(latMin),
+            "tl_x": rad2deg(lonMin),
+            "br_x": rad2deg(lonMax),
+        });
+    }
+
+    /**
+     * Download the flag of a country from FlightRadar24 and return it as bytes.
+     * Returns null if the flag is not found.
+     *
+     * @param {string} country - Country name
+     * @return {Promise<[object, string] | null>}
+     */
+    async getCountryFlag(country) {
+        const slug = country.toLowerCase().replaceAll(" ", "-");
+        const flagUrl = Core.countryFlagUrl(slug);
+
+        const headers = { ...Core.imageHeaders };
+        delete headers["origin"];
+
+        const { content, statusCode } = await this.__client.request(flagUrl, {
+            headers,
+            allowedErrorCodes: [403, 404],
+            timeout: this.timeout,
+        });
+
+        if (statusCode < 400) {
+            return [content, flagUrl.split(".").pop()];
+        }
+
+        return null;
+    }
+
+    /**
+     * Return the flight details from Data Live FlightRadar24.
+     *
+     * @param {Flight} flight - A Flight instance
+     * @return {Promise<object>}
+     */
+    async getFlightDetails(flight) {
+        // Stateless request so the concurrent fan-out in `getFlights(..., details=true)`
+        // doesn't interleave cookie writes on the shared session.
+        const { content } = await this.__client.requestStandalone(
+            Core.flightDataUrl(flight.id), { headers: Core.jsonHeaders, timeout: this.timeout },
+        );
+        return content;
+    }
+
+    /**
+     * Return a list of flights. See more options at setFlightTrackerConfig() method.
+     *
+     * @param {string} [airline] - The airline ICAO. Ex: "DAL"
+     * @param {string} [bounds] - Coordinates (y1, y2 ,x1, x2). Ex: "75.78,-75.78,-427.56,427.56"
+     * @param {string} [registration] - Aircraft registration
+     * @param {string} [aircraftType] - Aircraft model code. Ex: "B737"
+     * @param {boolean} [details] -  If true, it returns flights with detailed information
+     * @return {Promise<Array<Flight>>}
+     */
+    async getFlights(airline = null, bounds = null, registration = null, aircraftType = null, details = false) {
+        const params = { ...this.__flightTrackerConfig };
+
+        if (this.isLoggedIn()) {
+            params["enc"] = this.__client.getCookie("_frPl");
+        }
+        if (airline !== null) params["airline"] = airline;
+        if (bounds !== null) params["bounds"] = bounds;
+        if (registration !== null) params["reg"] = registration;
+        if (aircraftType !== null) params["type"] = aircraftType;
+
+        const { content } = await this.__client.request(Core.realTimeFlightTrackerDataUrl, {
+            params,
+            headers: Core.jsonHeaders,
+            timeout: this.timeout,
+        });
+
+        const flights = [];
+
+        for (const flightId in content) {
+            if (!Object.prototype.hasOwnProperty.call(content, flightId)) {
+                continue;
+            }
+            if (!isNumeric(flightId[0])) {
+                continue;
+            }
+            flights.push(new Flight(flightId, content[flightId]));
+        }
+
+        if (details) {
+            await mapConcurrent(flights, this.maxWorkers, async (flight) => {
+                flight.setFlightDetails(await this.getFlightDetails(flight));
+            });
+        }
+
+        return flights;
+    }
+
+    /**
+     * Return a copy of the current config of the Real Time Flight Tracker, used by getFlights() method.
+     *
+     * @return {FlightTrackerConfig}
+     */
+    getFlightTrackerConfig() {
+        return new FlightTrackerConfig({ ...this.__flightTrackerConfig });
+    }
+
+    /**
+     * Download historical data of a flight.
+     *
+     * @param {Flight} flight - A Flight instance.
+     * @param {string} fileType - Must be "CSV" or "KML"
+     * @param {number} timestamp - A Unix timestamp
+     */
+    async getHistoryData(flight, fileType, timestamp) {
+        if (!this.isLoggedIn()) {
+            throw new LoginError("You must log in to your account.");
+        }
+
+        fileType = fileType.toLowerCase();
+
+        if (!["csv", "kml"].includes(fileType)) {
+            throw new TypeError("File type '" + fileType + "' is not supported. Only CSV and KML are supported.");
+        }
+
+        const headers = { ...Core.jsonHeaders, "accesstoken": this.getLoginData()["accessToken"] };
+        const { content } = await this.__client.request(Core.historicalDataUrl(flight.id, fileType, timestamp), {
+            headers,
+            timeout: this.timeout,
+        });
+
+        return content;
+    }
+
+    /**
+     * Return the user data.
+     *
+     * @return {object}
+     */
+    getLoginData() {
+        if (!this.isLoggedIn()) {
+            throw new LoginError("You must log in to your account.");
+        }
+        return { ...this.__loginData["userData"] };
+    }
+
+    /**
+     * Return the most tracked data.
+     *
+     * @return {Promise<object>}
+     */
+    async getMostTracked() {
+        const { content } = await this.__client.request(
+            Core.mostTrackedUrl, { headers: Core.jsonHeaders, timeout: this.timeout });
+        return content;
+    }
+
+    /**
+     * Return boundaries of volcanic eruptions and ash clouds impacting aviation.
+     *
+     * @return {Promise<object>}
+     */
+    async getVolcanicEruptions() {
+        const { content } = await this.__client.request(
+            Core.volcanicEruptionDataUrl, { headers: Core.jsonHeaders, timeout: this.timeout },
+        );
+        return content;
+    }
+
+    /**
+     * Return all major zones on the globe.
+     *
+     * @return {object}
+     */
+    getZones() {
+        const zones = { ...Core.staticZones };
+        delete zones.version;
+        return zones;
+    }
+
+    /**
+     * Return the search result.
+     *
+     * @param {string} query
+     * @param {number} [limit=50]
+     * @return {Promise<object>}
+     */
+    async search(query, limit = 50) {
+        const { content } = await this.__client.request(
+            Core.searchDataUrl(query, limit), { headers: Core.jsonHeaders, timeout: this.timeout },
+        );
+
+        const results = content["results"] ?? [];
+        const countDict = content["stats"]?.["count"] ?? {};
+
+        let index = 0;
+        const data = {};
+
+        for (const name in countDict) {
+            if (!Object.prototype.hasOwnProperty.call(countDict, name)) {
+                continue;
+            }
+
+            const count = countDict[name];
+            data[name] = results.slice(index, index + count);
+            index += count;
+        }
+
+        return data;
+    }
+
+    /**
+     * Check if the user is logged into the FlightRadar24 account.
+     *
+     * @return {boolean}
+     */
+    isLoggedIn() {
+        return this.__loginData !== null;
+    }
+
+    /**
+     * Log in to a FlightRadar24 account.
+     *
+     * @param {string} user - Your email.
+     * @param {string} password - Your password.
+     * @return {Promise<undefined>}
+     */
+    async login(user, password) {
+        this.__loginData = null;
+        this.__client.clearCookies();
+
+        const { content, statusCode } = await this.__client.request(Core.userLoginUrl, {
+            headers: Core.jsonHeaders,
+            data: { "email": user, "password": password, "remember": "true", "type": "web" },
+            timeout: this.timeout,
+        });
+
+        if (statusCode < 200 || statusCode >= 300 || !content["success"]) {
+            throw new LoginError(
+                typeof content === "object" ? content["message"] : "Your email or password is incorrect",
+            );
+        }
+
+        this.__loginData = { "userData": content["userData"] };
+    }
+
+    /**
+     * Log out of the FlightRadar24 account.
+     *
+     * @return {Promise<boolean>} - Return a boolean indicating that it successfully logged out of the server.
+     */
+    async logout() {
+        if (this.__loginData === null) {
+            return true;
+        }
+
+        this.__loginData = null;
+
+        try {
+            const { statusCode } = await this.__client.request(
+                Core.userLogoutUrl, { headers: Core.jsonHeaders, timeout: this.timeout },
+            );
+            return statusCode >= 200 && statusCode < 300;
+        }
+        finally {
+            this.__client.clearCookies();
+        }
+    }
+
+    /**
+     * Set config for the Real Time Flight Tracker, used by getFlights() method.
+     *
+     * @param {FlightTrackerConfig} [flightTrackerConfig] - If null, set to the default config.
+     * @param {object} [config={}] - Config as an JSON object
+     * @return {undefined}
+     */
+    setFlightTrackerConfig(flightTrackerConfig = null, config = {}) {
+        if (flightTrackerConfig !== null) {
+            this.__flightTrackerConfig = flightTrackerConfig;
+        }
+
+        for (const key in config) {
+            if (Object.prototype.hasOwnProperty.call(config, key)) {
+                this.__flightTrackerConfig[key] = config[key].toString();
+            }
+        }
+    }
+}
+
+module.exports = FlightRadar24API;

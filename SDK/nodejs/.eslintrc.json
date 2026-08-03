@@ -1,0 +1,20 @@
+{
+  "env": {
+    "commonjs": true,
+    "es2021": true,
+    "node": true
+  },
+  "extends": "google",
+  "parserOptions": {
+    "ecmaVersion": "latest"
+  },
+  "rules": {
+    "max-len": ["error", {"code": 130, "ignoreStrings": true, "ignoreTemplateLiterals": true}],
+    "quotes": ["warn", "double"],
+    "indent": ["warn", 4],
+    "brace-style": ["warn", "stroustrup"],
+    "valid-jsdoc": ["warn"],
+    "require-jsdoc": ["warn"],
+    "object-curly-spacing": ["warn", "always"]
+  }
+}

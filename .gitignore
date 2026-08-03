@@ -1,2 +1,19 @@
 /build
 /dist
+
+# Python bytecode / cache
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build artifacts
+*.spec
+
+# macOS zip cruft (from the sound pack archive)
+**/__MACOSX/
+
+# Stray files
+nul
+
+# Personal runtime settings (tracked flights, notes, language, sound prefs)
+/myradar24_settings.json
