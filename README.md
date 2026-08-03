@@ -1,7 +1,7 @@
 # MyRadar24
 
-A desktop application for tracking flights in real time, built with **PyQt6** and powered by the **FlightRadar24 API**.
 DOWNLOAD LINK HERE: https://github.com/JustLachin/MyRadar24/releases/download/v1.0/MyRadar24.zip (JUST OPEN MyRadar42.exe file)
+A desktop application for tracking flights in real time, built with **PyQt6** and powered by the **FlightRadar24 API**.
 
 ![MyRadar24](logo.png)
 
